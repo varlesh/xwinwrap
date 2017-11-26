@@ -174,7 +174,7 @@ usage (void)
     fprintf (stderr, "Options:\n \
             -g      - Specify Geometry (w=width, h=height, x=x-coord, y=y-coord. ex: -g 640x480+100+100)\n \
             -ni     - Ignore Input\n \
-            -d      - Desktop Window Hack. Provide name of the \"Desktop\" window as parameter \
+            -d      - Desktop Window Hack. Provide name of the \"Desktop\" window as parameter\n \
             -argb   - RGB\n \
             -fdt    - force WID window a desktop type window\n \
             -fs     - Full Screen\n \
