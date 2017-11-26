@@ -54,6 +54,7 @@
 #include <string.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -65,12 +66,13 @@
 #define OPAQUE 0xffffffff
 
 #define NAME "xwinwrap"
-#define VERSION "0.3"
 
-#define DESKTOP_WINDOW_NAME_MAX_SIZE 25
-#define DEFAULT_DESKTOP_WINDOW_NAME "Desktop"
+#define ATOM(a) XInternAtom(display, #a, False)
 
-#define DEBUG_MSG(x) if(debug) { fprintf(stderr, x); }
+Display *display = NULL;
+int display_width;
+int display_height;
+int screen;
 
 typedef enum
 {
@@ -79,16 +81,26 @@ typedef enum
     SHAPE_TRIG,
 } win_shape;
 
+struct window {
+    Window root, window, desktop;
+    Drawable drawable;
+    Visual *visual;
+    Colormap colourmap;
+
+    unsigned int width;
+    unsigned int height;
+    int x;
+    int y;
+} window;
+
+bool debug = false;
+
 static pid_t pid = 0;
 
 static char **childArgv = 0;
 static int  nChildArgv  = 0;
-char desktop_window_name[DESKTOP_WINDOW_NAME_MAX_SIZE];
-int debug = 0;
 
-    static int
-addArguments (char **argv,
-        int  n)
+static int addArguments (char **argv, int  n)
 {
     char **newArgv;
     int  i;
@@ -106,78 +118,74 @@ addArguments (char **argv,
     return n;
 }
 
-    static void
-setWindowOpacity (Display      *dpy,
-        Window       win,
-        unsigned int opacity)
+static void setWindowOpacity (unsigned int opacity)
 {
     CARD32 o;
 
     o = opacity;
 
-    XChangeProperty (dpy, win, XInternAtom (dpy, "_NET_WM_WINDOW_OPACITY", 0),
-            XA_CARDINAL, 32, PropModeReplace,
-            (unsigned char *) &o, 1);
+    XChangeProperty (display, window.window, ATOM(_NET_WM_WINDOW_OPACITY),
+                     XA_CARDINAL, 32, PropModeReplace,
+                     (unsigned char *) &o, 1);
 }
 
-    static Visual *
-findArgbVisual (Display *dpy, int scr)
+static void init_x11()
 {
-    XVisualInfo		*xvi;
-    XVisualInfo		template;
-    int			nvi;
-    int			i;
-    XRenderPictFormat	*format;
-    Visual		*visual;
-
-    template.screen = scr;
-    template.depth  = 32;
-    template.class  = TrueColor;
-
-    xvi = XGetVisualInfo (dpy,
-            VisualScreenMask |
-            VisualDepthMask  |
-            VisualClassMask,
-            &template,
-            &nvi);
-    if (!xvi)
-        return 0;
-
-    visual = 0;
-    for (i = 0; i < nvi; i++)
+    display = XOpenDisplay (NULL);
+    if (!display)
     {
-        format = XRenderFindVisualFormat (dpy, xvi[i].visual);
-        if (format->type == PictTypeDirect && format->direct.alphaMask)
-        {
-            visual = xvi[i].visual;
-            break;
+        fprintf (stderr, NAME": Error: couldn't open display\n");
+        return;
+    }
+    screen = DefaultScreen(display);
+    display_width = DisplayWidth(display, screen);
+    display_height = DisplayHeight(display, screen);
+}
+
+static int get_argb_visual(Visual** visual, int *depth) {
+    XVisualInfo visual_template;
+    XVisualInfo *visual_list;
+    int nxvisuals = 0, i;
+
+    visual_template.screen = screen;
+    visual_list = XGetVisualInfo (display, VisualScreenMask,
+                                  &visual_template, &nxvisuals);
+    for (i = 0; i < nxvisuals; i++) {
+        if (visual_list[i].depth == 32 &&
+                (visual_list[i].red_mask   == 0xff0000 &&
+                 visual_list[i].green_mask == 0x00ff00 &&
+                 visual_list[i].blue_mask  == 0x0000ff)) {
+            *visual = visual_list[i].visual;
+            *depth = visual_list[i].depth;
+            if (debug)
+                fprintf(stderr, "Found ARGB Visual\n");
+            XFree(visual_list);
+            return 1;
         }
     }
-
-    XFree (xvi);
-
-    return visual;
+    if (debug)
+        fprintf(stderr, "No ARGB Visual found");
+    XFree(visual_list);
+    return 0;
 }
 
-    static void
-sigHandler (int sig)
+static void sigHandler (int sig)
 {
     kill (pid, sig);
 }
 
-    static void
-usage (void)
+static void usage (void)
 {
-    fprintf(stderr, "%s v%s- Modified by Shantanu Goel. Visit http://tech.shantanugoel.com for updates, queries and feature requests\n", NAME, VERSION);
-    fprintf (stderr, "\nUsage: %s [-g {w}x{h}+{x}+{y}] [-ni] [-argb] [-fdt] [-fs] [-s] [-st] [-sp] [-a] "
-            "[-b] [-nf] [-o OPACITY] [-sh SHAPE] [-ov]-- COMMAND ARG1...\n", NAME);
+    fprintf(stderr, "%s \n", NAME);
+    fprintf (stderr, "\nUsage: %s [-g {w}x{h}+{x}+{y}] [-ni] [-argb] [-fdt] [-fs] [-s] [-st] [-sp] [-a] [-d] "
+             "[-b] [-nf] [-o OPACITY] [-sh SHAPE] [-ov]-- COMMAND ARG1...\n", NAME);
     fprintf (stderr, "Options:\n \
             -g      - Specify Geometry (w=width, h=height, x=x-coord, y=y-coord. ex: -g 640x480+100+100)\n \
             -ni     - Ignore Input\n \
-            -d      - Desktop Window Hack. Provide name of the \"Desktop\" window as parameter\n \
             -argb   - RGB\n \
             -fdt    - force WID window a desktop type window\n \
             -fs     - Full Screen\n \
+            -un     - Undecorated\n \
             -s      - Sticky\n \
             -st     - Skip Taskbar\n \
             -sp     - Skip Pager\n \
@@ -187,140 +195,197 @@ usage (void)
             -o      - Opacity value between 0 to 1 (ex: -o 0.20)\n \
             -sh     - Shape of window (choose between rectangle, circle or triangle. Default is rectangle)\n \
             -ov     - Set override_redirect flag (For seamless desktop background integration in non-fullscreenmode)\n \
+            -d      - Daemonize\n \
             -debug  - Enable debug messages\n");
 }
 
-static Window find_desktop_window(Display *display, int screen, Window *root, Window *p_desktop)
-{
-    int i;
-    unsigned int n;
-    Window win = *root;
-    Window troot, parent, *children;
-    char *name;
-    int status;
-    int width  = DisplayWidth (display, screen);
-    int height = DisplayHeight (display, screen);
-    XWindowAttributes attrs;
 
-    XQueryTree(display, *root, &troot, &parent, &children, &n);
-    for (i = 0; i < (int) n; i++) 
-    {
-        status = XFetchName(display, children[i], &name);
-        status |= XGetWindowAttributes(display, children[i], &attrs);
-        if ((status != 0) && (NULL != name))
-        {
-            if( (attrs.map_state != 0) && (attrs.width == width) &&
-                    (attrs.height == height) && (!strcmp(name, desktop_window_name)) )
-            {
-                //DEBUG_MSG("Found Window:%s\n", name);
-                win = children[i];
-                XFree(children);
-                XFree(name);
-                *p_desktop = win;
-                return win;
-            }
-            if(name)
-            {
-                XFree(name);
+static Window find_subwindow(Window win, int w, int h)
+{
+    unsigned int i, j;
+    Window troot, parent, *children;
+    unsigned int n;
+
+    /* search subwindows with same size as display or work area */
+
+    for (i = 0; i < 10; i++) {
+        XQueryTree(display, win, &troot, &parent, &children, &n);
+
+        for (j = 0; j < n; j++) {
+            XWindowAttributes attrs;
+
+            if (XGetWindowAttributes(display, children[j], &attrs)) {
+                /* Window must be mapped and same size as display or
+                 * work space */
+                if (attrs.map_state != 0 && ((attrs.width == display_width
+                                              && attrs.height == display_height)
+                                             || (attrs.width == w && attrs.height == h))) {
+                    win = children[j];
+                    break;
+                }
             }
         }
+
+        XFree(children);
+        if (j == n) {
+            break;
+        }
     }
-    DEBUG_MSG("Desktop Window Not found\n");
-    return 0;
+
+    return win;
 }
 
-    int
-main (int argc, char **argv)
+static Window find_desktop_window(Window *p_root, Window *p_desktop)
 {
-    Display	    *dpy;
-    Window	    win;
-    Window	    root;
-    Window      p_desktop = 0;
-    int		    screen;
-    XSizeHints	xsh;
-    XWMHints	xwmh;
-    char	    widArg[256];
-    char	    *widArgv[] = { widArg };
-    char	    *endArg = NULL;
-    int		    i;
-    int		    status = 0;
+    Atom type;
+    int format, i;
+    unsigned long nitems, bytes;
+    unsigned int n;
+    Window root = RootWindow(display, screen);
+    Window win = root;
+    Window troot, parent, *children;
+    unsigned char *buf = NULL;
+
+    if (!p_root || !p_desktop) {
+        return 0;
+    }
+
+    /* some window managers set __SWM_VROOT to some child of root window */
+
+    XQueryTree(display, root, &troot, &parent, &children, &n);
+    for (i = 0; i < (int) n; i++) {
+        if (XGetWindowProperty(display, children[i], ATOM(__SWM_VROOT), 0, 1,
+                               False, XA_WINDOW, &type, &format, &nitems, &bytes, &buf)
+                == Success && type == XA_WINDOW) {
+            win = *(Window *) buf;
+            XFree(buf);
+            XFree(children);
+            if (debug)
+            {
+                fprintf(stderr,
+                        NAME": desktop window (%lx) found from __SWM_VROOT property\n",
+                        win);
+            }
+            fflush(stderr);
+            *p_root = win;
+            *p_desktop = win;
+            return win;
+        }
+
+        if (buf) {
+            XFree(buf);
+            buf = 0;
+        }
+    }
+    XFree(children);
+
+    /* get subwindows from root */
+    win = find_subwindow(root, -1, -1);
+
+    display_width = DisplayWidth(display, screen);
+    display_height = DisplayHeight(display, screen);
+
+    win = find_subwindow(win, display_width, display_height);
+
+    if (buf) {
+        XFree(buf);
+        buf = 0;
+    }
+
+    if (win != root && debug) {
+        fprintf(stderr,
+                NAME": desktop window (%lx) is subwindow of root window (%lx)\n",
+                win, root);
+    } else if (debug) {
+        fprintf(stderr, NAME": desktop window (%lx) is root window\n", win);
+    }
+
+    fflush(stderr);
+
+    *p_root = root;
+    *p_desktop = win;
+
+    return win;
+}
+
+int main(int argc, char **argv)
+{
+    char        widArg[256];
+    char        *widArgv[] = { widArg };
+    char        *endArg = NULL;
+    int         status = 0;
     unsigned int opacity = OPAQUE;
-    int		    x = 0;
-    int		    y = 0;
-    unsigned int width = WIDTH;
-    unsigned int height = HEIGHT;
-    int		    argb = 0;
-    int		    fullscreen = 0;
-    int		    noInput = 0;
-    int		    noFocus = 0;
-    int         set_desktop_type = 0;
-    Atom	    state[256];
-    int		    nState = 0;
-    int         override = 0;
+
+    int i;
+    bool have_argb_visual = false;
+    bool noInput = false;
+    bool argb = false;
+    bool set_desktop_type = false;
+    bool fullscreen = false;
+    bool noFocus = false;
+    bool override = false;
+    bool undecorated = false;
+    bool sticky = false;
+    bool below = false;
+    bool above = false;
+    bool skip_taskbar = false;
+    bool skip_pager = false;
+    bool daemonize = false;
+
     win_shape   shape = SHAPE_RECT;
     Pixmap      mask;
     GC          mask_gc;
     XGCValues   xgcv;
 
-    dpy = XOpenDisplay (NULL);
-    if (!dpy)
-    {
-        fprintf (stderr, "%s: Error: couldn't open display\n", argv[0]);
-        return 1;
-    }
-
-    screen = DefaultScreen (dpy);
-    root   = RootWindow (dpy, screen);
-    strcpy(desktop_window_name, DEFAULT_DESKTOP_WINDOW_NAME);
+    window.width = WIDTH;
+    window.height = HEIGHT;
 
     for (i = 1; i < argc; i++)
     {
         if (strcmp (argv[i], "-g") == 0)
         {
             if (++i < argc)
-                XParseGeometry (argv[i], &x, &y, &width, &height);
+                XParseGeometry (argv[i], &window.x, &window.y, &window.width, &window.height);
         }
         else if (strcmp (argv[i], "-ni") == 0)
         {
             noInput = 1;
         }
-        else if (strcmp (argv[i], "-d") == 0)
-        {
-            ++i;
-            strcpy(desktop_window_name, argv[i]);
-        }
         else if (strcmp (argv[i], "-argb") == 0)
         {
-            argb = 1;
+            argb = true;
         }
         else if (strcmp (argv[i], "-fdt") == 0)
         {
-            set_desktop_type = 1;
+            set_desktop_type = true;
         }
         else if (strcmp (argv[i], "-fs") == 0)
         {
-            state[nState++] = XInternAtom (dpy, "_NET_WM_STATE_FULLSCREEN", 0);
             fullscreen = 1;
+        }
+        else if (strcmp (argv[i], "-un") == 0)
+        {
+            undecorated = true;
         }
         else if (strcmp (argv[i], "-s") == 0)
         {
-            state[nState++] = XInternAtom (dpy, "_NET_WM_STATE_STICKY", 0);
+            sticky = true;
         }
         else if (strcmp (argv[i], "-st") == 0)
         {
-            state[nState++] = XInternAtom (dpy, "_NET_WM_STATE_SKIP_TASKBAR", 0);
+            skip_taskbar = true;
         }
         else if (strcmp (argv[i], "-sp") == 0)
         {
-            state[nState++] = XInternAtom (dpy, "_NET_WM_STATE_SKIP_PAGER", 0);
+            skip_pager = true;
         }
         else if (strcmp (argv[i], "-a") == 0)
         {
-            state[nState++] = XInternAtom (dpy, "_NET_WM_STATE_ABOVE", 0);
+            above = true;
         }
         else if (strcmp (argv[i], "-b") == 0)
         {
-            state[nState++] = XInternAtom (dpy, "_NET_WM_STATE_BELOW", 0);
+            below = true;
         }
         else if (strcmp (argv[i], "-nf") == 0)
         {
@@ -335,11 +400,11 @@ main (int argc, char **argv)
         {
             if (++i < argc)
             {
-                if(strcasecmp(argv[i], "circle") == 0)
+                if (strcasecmp(argv[i], "circle") == 0)
                 {
                     shape = SHAPE_CIRCLE;
                 }
-                else if(strcasecmp(argv[i], "triangle") == 0)
+                else if (strcasecmp(argv[i], "triangle") == 0)
                 {
                     shape = SHAPE_TRIG;
                 }
@@ -347,11 +412,15 @@ main (int argc, char **argv)
         }
         else if (strcmp (argv[i], "-ov") == 0)
         {
-            override = 1;
+            override = true;
         }
         else if (strcmp (argv[i], "-debug") == 0)
         {
-            debug = 1;
+            debug = true;
+        }
+        else if (strcmp (argv[i], "-d") == 0)
+        {
+            daemonize = true;
         }
         else if (strcmp (argv[i], "--") == 0)
         {
@@ -360,9 +429,37 @@ main (int argc, char **argv)
         else
         {
             usage ();
-
             return 1;
         }
+    }
+
+    if (daemonize)
+    {
+        pid_t process_id = 0;
+        pid_t sid = 0;
+        process_id = fork();
+        if (process_id < 0)
+        {
+            fprintf(stderr, "fork failed!\n");
+            exit(1);
+        }
+
+        if (process_id > 0)
+        {
+            fprintf(stderr, "pid of child process %d \n", process_id);
+            exit(0);
+        }
+        umask(0);
+        sid = setsid();
+        if (sid < 0)
+        {
+            exit(1);
+        }
+
+        chdir("/");
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
     }
 
     for (i = i + 1; i < argc; i++)
@@ -383,65 +480,208 @@ main (int argc, char **argv)
 
     addArguments (&endArg, 1);
 
+    init_x11();
+    if (!display)
+        return 1;
+
     if (fullscreen)
     {
-        xsh.flags  = PSize | PPosition;
-        xsh.width  = DisplayWidth (dpy, screen);
-        xsh.height = DisplayHeight (dpy, screen);
+        window.x = 0;
+        window.y = 0;
+        window.width  = DisplayWidth (display, screen);
+        window.height = DisplayHeight (display, screen);
+    }
+    int depth = 0, flags = CWOverrideRedirect | CWBackingStore;
+    Visual *visual = NULL;
+
+    if (!find_desktop_window(&window.root, &window.desktop)) {
+        fprintf (stderr, NAME": Error: couldn't find desktop window\n");
+        return 1;
+    }
+
+    if (argb && get_argb_visual(&visual, &depth))
+    {
+        have_argb_visual = true;
+        window.visual = visual;
+        window.colourmap = XCreateColormap(display,
+                                           DefaultRootWindow(display), window.visual, AllocNone);
     }
     else
     {
-        xsh.flags  = PSize;
-        xsh.width  = width;
-        xsh.height = height;
+        window.visual = DefaultVisual(display, screen);
+        window.colourmap = DefaultColormap(display, screen);
+        depth = CopyFromParent;
+        visual = CopyFromParent;
+
     }
 
-    xwmh.flags = InputHint;
-    xwmh.input = !noFocus;
+    if (override) {
+        /* An override_redirect True window.
+         * No WM hints or button processing needed. */
+        XSetWindowAttributes attrs = { ParentRelative, 0L, 0, 0L, 0, 0,
+                                       Always, 0L, 0L, False, StructureNotifyMask | ExposureMask, 0L,
+                                       True, 0, 0
+                                     };
 
-    if (argb)
-    {
-        XSetWindowAttributes attr;
-        Visual		     *visual;
-
-        visual = findArgbVisual (dpy, screen);
-        if (!visual)
+        if (have_argb_visual)
         {
-            fprintf (stderr, "%s: Error: couldn't find argb visual\n", argv[0]);
-            return 1;
-        }
-
-        attr.background_pixel = 0;
-        attr.border_pixel     = 0;
-        attr.colormap	      = XCreateColormap (dpy, root, visual, AllocNone);
-
-        win = XCreateWindow (dpy, root, 0, 0, xsh.width, xsh.height, 0,
-                32, InputOutput, visual,
-                CWBackPixel | CWBorderPixel | CWColormap, &attr);
-    }
-    else
-    {
-        XSetWindowAttributes attr;
-        attr.override_redirect = override;
-
-        if( override && find_desktop_window(dpy, screen, &root, &p_desktop) )
-        {
-            win = XCreateWindow (dpy, p_desktop, x, y, xsh.width, xsh.height, 0,
-                    CopyFromParent, InputOutput, CopyFromParent,
-                    CWOverrideRedirect, &attr);
+            attrs.colormap = window.colourmap;
+            flags |= CWBorderPixel | CWColormap;
         }
         else
         {
-            win = XCreateWindow (dpy, root, x, y, xsh.width, xsh.height, 0,
-                    CopyFromParent, InputOutput, CopyFromParent,
-                    CWOverrideRedirect, &attr);
+            flags |= CWBackPixel;
+        }
+
+        window.window = XCreateWindow(display, window.desktop, window.x,
+                                      window.y, window.width, window.height, 0, depth, InputOutput, visual,
+                                      flags, &attrs);
+        XLowerWindow(display, window.window);
+
+        fprintf(stderr, NAME": window type - override\n");
+        fflush(stderr);
+    }
+    else
+    {
+        XSetWindowAttributes attrs = { ParentRelative, 0L, 0, 0L, 0, 0,
+                                       Always, 0L, 0L, False, StructureNotifyMask | ExposureMask |
+                                       ButtonPressMask | ButtonReleaseMask, 0L, False, 0, 0
+                                     };
+
+        XWMHints wmHint;
+        Atom xa;
+
+        if (have_argb_visual)
+        {
+            attrs.colormap = window.colourmap;
+            flags |= CWBorderPixel | CWColormap;
+        }
+        else
+        {
+            flags |= CWBackPixel;
+        }
+
+        window.window = XCreateWindow(display, window.root, window.x,
+                                      window.y, window.width, window.height, 0, depth, InputOutput, visual,
+                                      flags, &attrs);
+
+        wmHint.flags = InputHint | StateHint;
+        // wmHint.input = undecorated ? False : True;
+        wmHint.input = !noFocus;
+        wmHint.initial_state = NormalState;
+
+        XSetWMProperties(display, window.window, NULL, NULL, argv,
+                         argc, NULL, &wmHint, NULL);
+
+        xa = ATOM(_NET_WM_WINDOW_TYPE);
+
+        Atom prop;
+        if (set_desktop_type)
+        {
+            prop = ATOM(_NET_WM_WINDOW_TYPE_DESKTOP);
+        } else {
+            prop = ATOM(_NET_WM_WINDOW_TYPE_NORMAL);
+        }
+
+        XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *) &prop, 1);
+
+        if (undecorated) {
+            xa = ATOM(_MOTIF_WM_HINTS);
+            if (xa != None) {
+                long prop[5] = { 2, 0, 0, 0, 0 };
+                XChangeProperty(display, window.window, xa, xa, 32,
+                                PropModeReplace, (unsigned char *) prop, 5);
+            }
+        }
+
+        /* Below other windows */
+        if (below) {
+
+            xa = ATOM(_WIN_LAYER);
+            if (xa != None) {
+                long prop = 0;
+
+                XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
+                                PropModeAppend, (unsigned char *) &prop, 1);
+            }
+
+            xa = ATOM(_NET_WM_STATE);
+            if (xa != None) {
+                Atom xa_prop = ATOM(_NET_WM_STATE_BELOW);
+
+                XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                                PropModeAppend, (unsigned char *) &xa_prop, 1);
+            }
+        }
+
+        /* Above other windows */
+        if (above) {
+
+            xa = ATOM(_WIN_LAYER);
+            if (xa != None) {
+                long prop = 6;
+
+                XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
+                                PropModeAppend, (unsigned char *) &prop, 1);
+            }
+
+            xa = ATOM(_NET_WM_STATE);
+            if (xa != None) {
+                Atom xa_prop = ATOM(_NET_WM_STATE_ABOVE);
+
+                XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                                PropModeAppend, (unsigned char *) &xa_prop, 1);
+            }
+        }
+
+        /* Sticky */
+        if (sticky) {
+
+            xa = ATOM(_NET_WM_DESKTOP);
+            if (xa != None) {
+                CARD32 xa_prop = 0xFFFFFFFF;
+
+                XChangeProperty(display, window.window, xa, XA_CARDINAL, 32,
+                                PropModeAppend, (unsigned char *) &xa_prop, 1);
+            }
+
+            xa = ATOM(_NET_WM_STATE);
+            if (xa != None) {
+                Atom xa_prop = ATOM(_NET_WM_STATE_STICKY);
+
+                XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                                PropModeAppend, (unsigned char *) &xa_prop, 1);
+            }
+        }
+
+        /* Skip taskbar */
+        if (skip_taskbar) {
+
+            xa = ATOM(_NET_WM_STATE);
+            if (xa != None) {
+                Atom xa_prop = ATOM(_NET_WM_STATE_SKIP_TASKBAR);
+
+                XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                                PropModeAppend, (unsigned char *) &xa_prop, 1);
+            }
+        }
+
+        /* Skip pager */
+        if (skip_pager) {
+
+            xa = ATOM(_NET_WM_STATE);
+            if (xa != None) {
+                Atom xa_prop = ATOM(_NET_WM_STATE_SKIP_PAGER);
+
+                XChangeProperty(display, window.window, xa, XA_ATOM, 32,
+                                PropModeAppend, (unsigned char *) &xa_prop, 1);
+            }
         }
     }
 
-    XSetWMProperties (dpy, win, NULL, NULL, argv, argc, &xsh, &xwmh, NULL);
-
     if (opacity != OPAQUE)
-        setWindowOpacity (dpy, win, opacity);
+        setWindowOpacity (opacity);
 
     if (noInput)
     {
@@ -450,89 +690,73 @@ main (int argc, char **argv)
         region = XCreateRegion ();
         if (region)
         {
-            XShapeCombineRegion (dpy, win, ShapeInput, 0, 0, region, ShapeSet);
+            XShapeCombineRegion (display, window.window, ShapeInput, 0, 0, region, ShapeSet);
             XDestroyRegion (region);
         }
     }
 
-    if (nState)
-        XChangeProperty (dpy, win, XInternAtom (dpy, "_NET_WM_STATE", 0),
-                XA_ATOM, 32, PropModeReplace,
-                (unsigned char *) state, nState);
-
-    if (set_desktop_type) {
-        Atom type;
-        type = XInternAtom (dpy, "_NET_WM_WINDOW_TYPE_DESKTOP", 0);
-
-        XChangeProperty (dpy, win, XInternAtom (dpy, "_NET_WM_WINDOW_TYPE", 1),
-                        XA_ATOM, 32, PropModeReplace,
-                        (unsigned char *) &type, 1);
-    }
-
     if (shape)
     {
-        mask = XCreatePixmap(dpy, win, width, height, 1);
-        mask_gc = XCreateGC(dpy, mask, 0, &xgcv);
+        mask = XCreatePixmap(display, window.window, window.width, window.height, 1);
+        mask_gc = XCreateGC(display, mask, 0, &xgcv);
 
-        switch(shape)
+        switch (shape)
         {
-            //Nothing special to be done if it's a rectangle
-            case SHAPE_CIRCLE:
-                /* fill mask */
-                XSetForeground(dpy, mask_gc, 0);
-                XFillRectangle(dpy, mask, mask_gc, 0, 0, width, height);
+        //Nothing special to be done if it's a rectangle
+        case SHAPE_CIRCLE:
+            /* fill mask */
+            XSetForeground(display, mask_gc, 0);
+            XFillRectangle(display, mask, mask_gc, 0, 0, window.width, window.height);
 
-                XSetForeground(dpy, mask_gc, 1);
-                XFillArc(dpy, mask, mask_gc, 0, 0, width, height, 0, 23040);
-                break;
+            XSetForeground(display, mask_gc, 1);
+            XFillArc(display, mask, mask_gc, 0, 0, window.width, window.height, 0, 23040);
+            break;
 
-            case SHAPE_TRIG:
-                {
-                    XPoint points[3] = { {0, height},
-                        {width/2, 0},
-                        {width, height} };
+        case SHAPE_TRIG:
+        {
+            XPoint points[3] = { {0, window.height},
+                {window.width / 2, 0},
+                {window.width, window.height}
+            };
 
-                    XSetForeground(dpy, mask_gc, 0);
-                    XFillRectangle(dpy, mask, mask_gc, 0, 0, width, height);
+            XSetForeground(display, mask_gc, 0);
+            XFillRectangle(display, mask, mask_gc, 0, 0, window.width, window.height);
 
-                    XSetForeground(dpy, mask_gc, 1);
-                    XFillPolygon(dpy, mask, mask_gc, points, 3, Complex, CoordModeOrigin);
-                }
+            XSetForeground(display, mask_gc, 1);
+            XFillPolygon(display, mask, mask_gc, points, 3, Complex, CoordModeOrigin);
+        }
 
-                break;
+        break;
 
-            default:
-                break;
+        default:
+            break;
 
         }
         /* combine */
-        XShapeCombineMask(dpy, win, ShapeBounding, 0, 0, mask, ShapeSet);
+        XShapeCombineMask(display, window.window, ShapeBounding, 0, 0, mask, ShapeSet);
     }
 
-    XMapWindow (dpy, win);
 
-    if(p_desktop == 0)
-    {
-        XLowerWindow(dpy, win);
-    }
 
-    XSync (dpy, win);
+    XMapWindow(display, window.window);
 
-    sprintf (widArg, "0x%x", (int) win);
+    XSync (display, window.window);
+
+    sprintf (widArg, "0x%x", (int) window.window);
 
     pid = fork ();
 
     switch (pid) {
-        case -1:
-            perror ("fork");
-            return 1;
-        case 0:
-            execvp (childArgv[0], childArgv);
-            perror (childArgv[0]);
-            exit (2);
-            break;
-        default:
-            break;
+    case -1:
+        perror ("fork");
+        return 1;
+    case 0:
+        execvp (childArgv[0], childArgv);
+        perror (childArgv[0]);
+        exit (2);
+        break;
+    default:
+        break;
     }
 
     signal (SIGTERM, sigHandler);
@@ -544,14 +768,15 @@ main (int argc, char **argv)
         {
             if (WIFEXITED (status))
                 fprintf (stderr, "%s died, exit status %d\n", childArgv[0],
-                        WEXITSTATUS (status));
+                         WEXITSTATUS (status));
 
             break;
         }
     }
 
-    XDestroyWindow (dpy, win);
-    XCloseDisplay (dpy);
+    XDestroyWindow (display, window.window);
+    XCloseDisplay (display);
+
 
     return 0;
 }

@@ -18,4 +18,7 @@ install: xwinwrap
 clean:
 	$(RM) xwinwrap
 
+uninstall:
+	rm -f '$(DESTDIR)$(bindir)/xwinwrap'
+
 .PHONY: all install clean
