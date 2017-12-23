@@ -7,7 +7,7 @@ Xwinwrap allows you to stick an app such as a videoplayer or gif viewer to your 
 
 ```
 sudo apt-get install xorg-dev build-essential libx11-dev x11proto-xext-dev libxrender-dev libxext-dev
-git clone https://github.com/aaahh/xwinwrap.git
+git clone https://github.com/varlesh/xwinwrap.git
 cd xwinwrap
 make
 sudo make install
