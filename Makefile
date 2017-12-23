@@ -2,7 +2,7 @@ CFLAGS = -g -O2 -Wall -Wextra
 LDFLAGS =
 LDLIBS = -lX11 -lXext -lXrender
 
-prefix = /usr/local
+prefix = /usr
 bindir = $(prefix)/bin
 
 CC = cc

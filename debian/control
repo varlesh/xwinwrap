@@ -1,0 +1,14 @@
+Source: xwinwrap
+Section: x11
+Priority: extra
+Maintainer: Alexey Varfolomeev <varlesh@gmail.com>
+Build-Depends: build-essential, xorg-dev, debhelper (>= 5)
+Standards-Version: 3.7.2
+Homepage: https://github.com/varlesh/xwinwrap
+
+Package: xwinwrap
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Conflicts: shantz-xwinwrap
+Description: Set a video or a screensaver as your background
+ xwinrap is a cool program for setting as background a video or a screensaver.
